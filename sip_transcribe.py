@@ -17,16 +17,14 @@
 
 from __future__ import print_function
 
-from multiprocessing import Process, Event, Queue
+from multiprocessing import Event
 from Queue import Empty
 import argparse
 import datetime
-import sys
 import time
 import os
 import socket
 import sys
-from threading import Event
 
 from application.notification import NotificationCenter
 from sipsimple.account import AccountManager, Account
@@ -39,81 +37,7 @@ from sipsimple.session import Session
 from sipsimple.streams import AudioStream
 from sipsimple.threading.green import run_in_green_thread
 
-def do_recognition(queue, event, max_no_speech=120, debug=False,
-                   hmm='/usr/local/share/pocketsphinx/model/en-us/en-us',
-                   lm='/usr/local/share/pocketsphinx/model/en-us/en-us.lm.bin',
-                   cmudict='/usr/local/share/pocketsphinx/model/en-us/cmudict-en-us.dict'):
-    '''
-    Read audio from the system default recording device and feed it to
-    pocketsphinx. Put recognized text in `queue`. Shut down if `event`
-    is set. If no speech is detected for `max_no_speech` seconds, set
-    `event` and quit.
-    '''
-    from pocketsphinx import Decoder
-    import pyaudio
-    if not debug:
-        # PortAudio is chatty on startup.
-        f = open(os.devnull, 'wb')
-        os.dup2(f.fileno(), sys.stderr.fileno())
-    config = Decoder.default_config()
-    config.set_string('-hmm', hmm)
-    config.set_string('-lm', lm)
-    config.set_string('-dict', cmudict)
-    if not debug:
-        config.set_string('-logfn', '/dev/null')
-    decoder = Decoder(config)
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    stream.start_stream()
-    in_speech_bf = True
-    no_speech_timer = None
-    now_in_speech = False
-    decoder.start_utt()
-    try:
-        while not event.is_set() and stream.is_active():
-            buf = stream.read(1024)
-            if buf:
-                decoder.process_raw(buf, False, False)
-                now_in_speech = decoder.get_in_speech()
-                if debug and now_in_speech:
-                    print('Found speech', file=sys.stderr)
-                if now_in_speech != in_speech_bf:
-                    in_speech_bf = now_in_speech
-                    if not in_speech_bf:
-                        if debug:
-                            print('Processing speech', file=sys.stderr)
-                        # No speech, but there was speech before, so, process.
-                        decoder.end_utt()
-                        try:
-                            speech = decoder.hyp().hypstr
-                            if speech != '':
-                                if debug:
-                                    print('Speech: ' + speech, file=sys.stderr)
-                                queue.put_nowait(speech)
-                        except AttributeError:
-                            pass
-                        decoder.start_utt()
-                    else:
-                        # Got some speech, reset timer.
-                        no_speech_timer = None
-            else:
-                if debug:
-                    print('No audio', file=sys.stderr)
-                # Wait a bit...
-                event.wait(0.1)
-            if not now_in_speech:
-                if no_speech_timer is None:
-                    no_speech_timer = datetime.datetime.now()
-                elif (datetime.datetime.now() - no_speech_timer).total_seconds() > max_no_speech:
-                    if debug:
-                        print('No speech, timing out', file=sys.stderr)
-                    event.set()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if stream.is_active():
-            stream.stop_stream()
-        stream.close()
+from recognition import run_recognition, get_parser as base_get_parser
 
 def create_account(settings):
     # Totally guessing here
@@ -200,13 +124,10 @@ def transcribe(sip_url, max_call_length=3600, **kwargs):
     Yield transcribed text as strings as they are recognized.
     Disconnect the call if it lasts more than `max_call_length` seconds.
 
-    Additional kwargs are passed to do_recognition.
+    Additional kwargs are passed to run_recognition.
     '''
     # Start the transcription process.
-    recognizer_event = Event()
-    text_queue = Queue()
-    p = Process(target=do_recognition, args=(text_queue, recognizer_event), kwargs=kwargs)
-    p.start()
+    (p, recognizer_event, text_queue) = run_recognition(**kwargs)
     # Start the SIP call
     application = SimpleSIPApplication()
     application.call(sip_url)
@@ -233,19 +154,10 @@ def transcribe(sip_url, max_call_length=3600, **kwargs):
         application.ended.wait()
 
 def get_parser():
-    parser = argparse.ArgumentParser(description='Transcribe SIP session')
+    parser = base_get_parser()
     parser.add_argument('sip_url', help='URL of a SIP session to transcribe')
     parser.add_argument('--debug', action='store_true',
                         help='Output debug logging')
-    parser.add_argument('--hmm',
-                        default='/usr/local/share/pocketsphinx/model/en-us/en-us',
-                        help='Path to a pocketsphinx HMM data directory')
-    parser.add_argument('--lm',
-                        default='/usr/local/share/pocketsphinx/model/en-us/en-us.lm.bin',
-                        help='Path to a pocketsphinx language model file')
-    parser.add_argument('--cmudict',
-                        default='/usr/local/share/pocketsphinx/model/en-us/cmudict-en-us.dict',
-                        help='Path to a pocketsphinx CMU dictionary file')
     return parser
 
 def main():
