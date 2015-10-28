@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y curl
 # Download latest pocketsphinx English language model/HMM
 ADD download-pocketsphinx-lm.sh /tmp/
 RUN sh /tmp/download-pocketsphinx-lm.sh
-RUN apt-get install -y pkg-config build-essential bison python-dev python-pip swig2.0 python-sipsimple python-pyaudio pulseaudio pulseaudio-utils psmisc
+RUN apt-get install -y pkg-config build-essential bison python-dev python-pip swig2.0 python-sipsimple psmisc
 ADD install-pocketsphinx.sh /tmp/
 RUN sh /tmp/install-pocketsphinx.sh
 RUN pip install etherpad_lite

@@ -23,12 +23,15 @@ import argparse
 import datetime
 import time
 import os
+import shutil
 import socket
 import sys
+import tempfile
 
 from application.notification import NotificationCenter
 from sipsimple.account import AccountManager, Account
 from sipsimple.application import SIPApplication
+from sipsimple.audio import WaveRecorder
 from sipsimple.storage import MemoryStorage
 from sipsimple.configuration.settings import SIPSimpleSettings
 from sipsimple.core import SIPURI, SIPCoreError, ToHeader
@@ -53,28 +56,28 @@ def create_account(settings):
     return a
 
 class SimpleSIPApplication(SIPApplication):
-    def __init__(self, debug=False):
+    def __init__(self, url, wave_fifo, debug=False):
         SIPApplication.__init__(self)
         self.ended = Event()
-        self.callee = None
+        self.callee = url
         self.session = None
         self.debug = debug
+        self.recorder = None
+        self._wave_fifo = wave_fifo
         notification_center = NotificationCenter()
         notification_center.add_observer(self)
 
-    def call(self, url):
-        self.callee = url
+    def call(self):
         self.start(MemoryStorage())
 
     @run_in_green_thread
     def _NH_SIPApplicationDidStart(self, notification):
         settings = SIPSimpleSettings()
-        # We don't need a microphone
+        # We don't need audio devices.
         settings.audio.input_device = None
         settings.audio.alert_device = None
-        # Use the default audio output.
-        #TODO: allow specifying this somehow?
-        #settings.audio.output_device = None
+        settings.audio.output_device = None
+        settings.audio.sample_rate = 16000
         if self.debug:
             settings.logs.trace_pjsip = True
         account = create_account(settings)
@@ -97,14 +100,22 @@ class SimpleSIPApplication(SIPApplication):
         pass
 
     def _NH_SIPSessionDidStart(self, notification):
-        pass
+        self.recorder = WaveRecorder(SIPApplication.voice_audio_mixer,
+                                     self._wave_fifo)
+        session = notification.sender
+        audio_stream = session.streams[0]
+        audio_stream.bridge.add(self.recorder)
+        self.recorder.start()
 
     def _NH_SIPSessionDidFail(self, notification):
         print('Failed to connect', file=sys.stderr)
         self.stop()
 
     def _NH_SIPSessionWillEnd(self, notification):
-        pass
+        session = notification.sender
+        audio_stream = session.streams[0]
+        self.recorder.stop()
+        audio_stream.bridge.remove(self.recorder)
 
     def _NH_SIPSessionDidEnd(self, notification):
         self.stop()
@@ -126,11 +137,15 @@ def transcribe(sip_url, max_call_length=3600, **kwargs):
 
     Additional kwargs are passed to run_recognition.
     '''
+    # Create a fifo to pass audio data around.
+    tempdir = tempfile.mkdtemp()
+    wave_fifo = os.path.join(tempdir, 'wave-fifo')
+    os.mkfifo(wave_fifo)
     # Start the transcription process.
-    (p, recognizer_event, text_queue) = run_recognition(**kwargs)
+    (p, recognizer_event, text_queue) = run_recognition(wave_fifo, **kwargs)
     # Start the SIP call
-    application = SimpleSIPApplication()
-    application.call(sip_url)
+    application = SimpleSIPApplication(sip_url, wave_fifo)
+    application.call()
     join_process = True
     try:
         while not application.ended.is_set() and not recognizer_event.is_set():
@@ -152,6 +167,10 @@ def transcribe(sip_url, max_call_length=3600, **kwargs):
         if application.session:
             application.session.end()
         application.ended.wait()
+        try:
+            shutil.rmtree(tempdir)
+        except Exception as e:
+            print('Failed to remove tempdir: %s' % str(e), file=sys.stderr)
 
 def get_parser():
     parser = base_get_parser()

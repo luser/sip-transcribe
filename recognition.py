@@ -25,22 +25,18 @@ import sys
 from multiprocessing import Process, Event, Queue
 from Queue import Empty
 
-def recognition_worker(queue, event, max_no_speech=120, debug=False,
+def recognition_worker(audio_file,
+                       queue, event, max_no_speech=120, debug=False,
                        hmm='/usr/local/share/pocketsphinx/model/en-us/en-us',
                        lm='/usr/local/share/pocketsphinx/model/en-us/en-us.lm.bin',
                        cmudict='/usr/local/share/pocketsphinx/model/en-us/cmudict-en-us.dict'):
     '''
-    Read audio from the system default recording device and feed it to
-    pocketsphinx. Put recognized text in `queue`. Shut down if `event`
-    is set. If no speech is detected for `max_no_speech` seconds, set
+    Read audio from `audio_file and feed it to pocketsphinx.
+    Put recognized text in `queue`. Shut down if `event` is set.
+    If no speech is detected for `max_no_speech` seconds, set
     `event` and quit.
     '''
     from pocketsphinx import Decoder
-    import pyaudio
-    if not debug:
-        # PortAudio is chatty on startup.
-        f = open(os.devnull, 'wb')
-        os.dup2(f.fileno(), sys.stderr.fileno())
     config = Decoder.default_config()
     config.set_string('-hmm', hmm)
     config.set_string('-lm', lm)
@@ -48,69 +44,67 @@ def recognition_worker(queue, event, max_no_speech=120, debug=False,
     if not debug:
         config.set_string('-logfn', '/dev/null')
     decoder = Decoder(config)
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
-    stream.start_stream()
     in_speech_bf = True
     no_speech_timer = None
     now_in_speech = False
     decoder.start_utt()
     try:
-        while not event.is_set() and stream.is_active():
-            buf = stream.read(1024)
-            if buf:
-                decoder.process_raw(buf, False, False)
-                now_in_speech = decoder.get_in_speech()
-                if debug and now_in_speech:
-                    print('Found speech', file=sys.stderr)
-                if now_in_speech != in_speech_bf:
-                    in_speech_bf = now_in_speech
-                    if not in_speech_bf:
-                        if debug:
-                            print('Processing speech', file=sys.stderr)
-                        # No speech, but there was speech before, so, process.
-                        decoder.end_utt()
-                        try:
-                            speech = decoder.hyp().hypstr
-                            if speech != '':
-                                if debug:
-                                    print('Speech: ' + speech, file=sys.stderr)
-                                queue.put_nowait(speech)
-                        except AttributeError:
-                            pass
-                        decoder.start_utt()
-                    else:
-                        # Got some speech, reset timer.
-                        no_speech_timer = None
-            else:
-                if debug:
-                    print('No audio', file=sys.stderr)
-                # Wait a bit...
-                event.wait(0.1)
-            if not now_in_speech:
-                if no_speech_timer is None:
-                    no_speech_timer = datetime.datetime.now()
-                elif (datetime.datetime.now() - no_speech_timer).total_seconds() > max_no_speech:
+        with open(audio_file, 'rb') as f:
+            f.read(40) # read RIFF header
+            # TODO: Probably should sanity check the audio format...
+            while not event.is_set():
+                buf = f.read(1024)
+                if buf:
+                    decoder.process_raw(buf, False, False)
+                    now_in_speech = decoder.get_in_speech()
+                    if debug and now_in_speech:
+                        print('Found speech', file=sys.stderr)
+                    if now_in_speech != in_speech_bf:
+                        in_speech_bf = now_in_speech
+                        if not in_speech_bf:
+                            if debug:
+                                print('Processing speech', file=sys.stderr)
+                            # No speech, but there was speech before, so, process.
+                            decoder.end_utt()
+                            try:
+                                speech = decoder.hyp().hypstr
+                                if speech != '':
+                                    if debug:
+                                        print('Speech: ' + speech, file=sys.stderr)
+                                    queue.put_nowait(speech)
+                            except AttributeError:
+                                pass
+                            decoder.start_utt()
+                        else:
+                            # Got some speech, reset timer.
+                            no_speech_timer = None
+                else:
                     if debug:
-                        print('No speech, timing out', file=sys.stderr)
-                    event.set()
+                        print('No audio', file=sys.stderr)
+                    # Wait a bit...
+                    event.wait(0.1)
+                if not now_in_speech:
+                    if no_speech_timer is None:
+                        no_speech_timer = datetime.datetime.now()
+                    elif (datetime.datetime.now() - no_speech_timer).total_seconds() > max_no_speech:
+                        if debug:
+                            print('No speech, timing out', file=sys.stderr)
+                        event.set()
     except KeyboardInterrupt:
         pass
-    finally:
-        if stream.is_active():
-            stream.stop_stream()
-        stream.close()
 
-def run_recognition(**kwargs):
+
+def run_recognition(audio_file, **kwargs):
     '''
-    Run PocketSphinx recognition in a background process on the default audio
-    input device. `kwargs` will be passed to `recognition_worker`.
+    Run PocketSphinx recognition in a background process on `audio_file`.
+    `kwargs` will be passed to `recognition_worker`.
     Return (process, event, queue). Recognized text will be posted to `queue`,
     `event` can be set to terminate the recognition process.
     '''
     event = Event()
     queue = Queue()
-    p = Process(target=recognition_worker, args=(queue, event), kwargs=kwargs)
+    p = Process(target=recognition_worker, args=(audio_file, queue, event),
+                kwargs=kwargs)
     p.start()
     return (p, event, queue)
 
@@ -129,8 +123,11 @@ def get_parser():
 
 def main():
     parser = get_parser()
+    # We don't want the other scripts to inherit this.
+    parser.add_argument('file', help='Audio file on which to run recognition.')
     args = parser.parse_args()
-    (p, event, queue) = run_recognition(**vars(args))
+    kwargs = vars(args)
+    (p, event, queue) = run_recognition(kwargs.pop('file'), **kwargs)
     join_process = True
     try:
         while not event.is_set():
